@@ -1,0 +1,164 @@
+import streamlit as st
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
+from ml_ensemble import probs,y_test # you would need to get params from the named .py file
+import seaborn as sns
+from segment_ananlysis import impact_pivot
+from Churn_Train import df
+from lifelines import KaplanMeierFitter
+
+
+# --- Business costs ---
+gain_tp = 1098   # save a churner
+cost_fp = -102   # unnecessary retention
+cost_fn = -1200  # missed churner
+gain_tn = 0      # correctly ignored
+
+st.title("📊 Telco Churn Cost-Benefit Dashboard")
+
+# Threshold slider
+threshold = st.slider("Select Threshold", 0.0, 1.0, 0.1, 0.01)
+
+# Predictions
+preds = (probs >= threshold).astype(int)
+tn, fp, fn, tp = confusion_matrix(y_test, preds).ravel()
+
+# Profit calculation
+profit = tp*gain_tp + fp*cost_fp + fn*cost_fn + tn*gain_tn
+
+st.write(f"### At threshold {threshold:.2f}, Expected Profit = **${profit:,.0f}**")
+
+# Confusion matrix breakdown
+st.write(f"True Positives (Saved churners): {tp}")
+st.write(f"False Positives (Unnecessary retention offers): {fp}")
+st.write(f"False Negatives (Missed churners): {fn}")
+st.write(f"True Negatives: {tn}")
+
+# Profit curve
+thresholds = np.linspace(0.0, 1.0, 100)
+profits = []
+for t in thresholds:
+    preds = (probs >= t).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_test, preds).ravel()
+    profits.append(tp*gain_tp + fp*cost_fp + fn*cost_fn + tn*gain_tn)
+
+plt.figure(figsize=(8,5))
+plt.plot(thresholds, profits, 'b-')
+plt.axvline(threshold, color='r', linestyle='--')
+plt.xlabel("Threshold")
+plt.ylabel("Profit")
+plt.title("Profit vs Threshold")
+st.pyplot(plt)
+
+st.write("📈Profit peaks at a 4% threshold.Lowering it captures more churners "
+         "(higher cost, more retention).Raising it cuts costs but misses at-risk customers.")
+
+# Load preprocessed dataset (use your "segments" df directly if in same file)
+segments = pd.read_csv(r"C:\Users\HP\PycharmProjects\temptestflask\Machine Learning\Segment Impact.csv")
+
+st.title("📊 Churn Segmentation Dashboard")
+
+# --- Filters ---
+contract = st.selectbox("Contract Type", ["All"] + sorted(segments["Contract"].unique()))
+tenure = st.selectbox("Tenure Group", ["All"] + sorted(segments["TenureGroup"].unique()))
+payment = st.selectbox("Payment Method", ["All"] + sorted(segments["PaymentMethod"].unique()))
+
+filtered = segments.copy()
+if contract != "All":
+    filtered = filtered[filtered["Contract"] == contract]
+if tenure != "All":
+    filtered = filtered[filtered["TenureGroup"] == tenure]
+if payment != "All":
+    filtered = filtered[filtered["PaymentMethod"] == payment]
+
+# --- KPIs ---
+st.subheader("📌 KPIs for Selected Segment")
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Churn Rate", f"{filtered['churn_rate'].mean():.2%}")
+col2.metric("Avg Revenue", f"${filtered['avg_revenue'].mean():.2f}")
+col3.metric("Expected LTV", f"${filtered['expected_ltv'].mean():.2f}")
+col4.metric("Profit at Risk", f"${filtered['impact'].sum():,.0f}")
+
+# --- Comparison Chart ---
+st.subheader("📌  Impact and Priority Comparison Across Customer Segments")
+st.subheader("📊 Comparison: Churn Rate vs Impact")
+fig, ax = plt.subplots(figsize=(10,5))
+sns.barplot(data=filtered, x="priority", y="impact", hue="Contract", ax=ax,palette='Set2')
+ax.set_title("Impact by Priority & Contract")
+st.pyplot(fig)
+st.write("High-Value & High-Risk customers on month-to-month contracts drive the largest churn impact."
+         "Prioritizing retention offers here delivers the highest ROI.Low-Value segments show limited impact, suggesting lower intervention priority."
+         "The same goes for the following plots")
+
+fig, ax = plt.subplots(figsize=(10,5))
+sns.barplot(data=filtered, x="priority", y="impact", hue="PaymentMethod", ax=ax,palette='Set2')
+ax.set_title("Impact by Priority & Payment Method")
+st.pyplot(fig)
+st.text('')
+
+fig, ax = plt.subplots(figsize=(10,5))
+sns.barplot(data=filtered, x="priority", y="impact", hue="TenureGroup", ax=ax,palette='Set2')
+ax.set_title("Impact by Priority & Tenure")
+st.pyplot(fig)
+st.text('')
+
+fig, ax = plt.subplots(figsize=(10,5))
+sns.barplot(data=filtered, x="priority", y="impact", hue="SeniorCitizen", ax=ax,palette='Set2')
+ax.set_title("Impact by Priority & Age")
+st.pyplot(fig)
+st.text('')
+
+fig,ax = plt.subplots(figsize=(12,6))
+plt.scatter(
+    segments['expected_ltv'],
+    segments['churn_rate'],
+    s=segments['impact'] / 50,  # scale bubble size
+    alpha=0.6,
+    c=segments['impact'],
+    cmap='viridis'
+)
+st.text('')
+ax.set_xlabel('Expected LTV')
+ax.set_ylabel('Churn Rate')
+ax.set_title('Impact Bubble Chart (Size = Impact)')
+plt.colorbar(label='Impact')
+st.pyplot(fig)
+st.text('')
+st.subheader("🔮 Kaplan Meier Churn Forcast for Selected Segment")
+kmf =  KaplanMeierFitter()
+fig,ax = plt.subplots(figsize=(10,6))
+for name, grouped_df in df.groupby('Contract'):
+    kmf.fit(grouped_df['tenure'],grouped_df['Churn'],label=name)
+    kmf.plot_survival_function(ax=ax)
+ax.set_title('Kaplan-Meier Churn Curves by Contract Type')
+ax.set_xlabel('Time')
+ax.set_ylabel('Churn Probability')
+plt.grid(True)
+plt.tight_layout()
+st.pyplot(fig)
+st.write("Month-to-month contracts show rapid churn, while longer terms (1–2 years) retain customers better."
+         "Use this to guide retention strategies and upsell opportunities.")
+
+fig,ax = plt.subplots(figsize=(10,6))
+for name, grouped_df in df.groupby('PaymentMethod'):
+    kmf.fit(grouped_df['tenure'],grouped_df['Churn'],label=name)
+    kmf.plot_survival_function(ax=ax)
+ax.set_title('Kaplan-Meier Churn Curves By Payment Methods')
+ax.set_xlabel('Time')
+ax.set_ylabel('Churn Probability')
+plt.grid(True)
+plt.tight_layout()
+st.pyplot(fig)
+
+
+
+# --- Top 10 Segments ---
+st.subheader("🚨 Top 10 Segments to Prioritize")
+top10 = filtered.nlargest(10, "impact")[["Contract","PaymentMethod","TenureGroup","priority","impact"]]
+st.dataframe(top10)
+
+st.subheader('✅ The Only Impactful Segments That Are Secure')
+secured = segments[segments['priority']== 'High Value&Low Risk'].head(3)
+st.dataframe(secured)

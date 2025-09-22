@@ -1,0 +1,278 @@
+# ====================================
+# Telco Customer Churn - Stacking Model
+# ====================================
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from imblearn.over_sampling import SMOTE
+from lightgbm import LGBMClassifier
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier, StackingClassifier
+from sklearn.feature_selection import SelectKBest, f_classif, chi2
+from sklearn.metrics import classification_report, confusion_matrix, roc_curve,auc
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, LabelEncoder
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.metrics import average_precision_score
+from xgboost import XGBClassifier
+from lifelines import KaplanMeierFitter
+import shap
+
+
+
+# ======================
+# --- PreProcess ---
+# ======================
+path = 'file_path/name'
+df = pd.read_csv(path)  # Load dataset
+pd.set_option('display.max_columns', None)
+
+# Handle missing/invalid values in TotalCharges
+df['TotalCharges'] = df['TotalCharges'].str.strip()
+df['TotalCharges'] = df['TotalCharges'].replace('', np.nan)
+df['TotalCharges'] = pd.to_numeric(df['TotalCharges'])
+df['TotalCharges'] = df['TotalCharges'].fillna(df['TotalCharges'].median())
+
+# Convert SeniorCitizen to categorical
+df['SeniorCitizen'] = df['SeniorCitizen'].astype('category')
+# Drop useless columns
+df = df.drop(columns=['customerID'])
+
+
+# ==============================
+# --- Feature Engineering ---
+# ==============================
+categorical = df.select_dtypes(include=['object', 'category']).columns.drop('Churn')
+numerical = df.select_dtypes(exclude=['object', 'category']).columns
+
+
+def scale_transform(scale=False):
+    """Scaling function for numerical columns."""
+    if scale:
+        preprocess = ColumnTransformer([
+            ('scale', StandardScaler(), numerical)
+        ])
+    else:
+        preprocess = ColumnTransformer([
+            ('scale', 'passthrough', numerical)
+        ])
+    return preprocess
+
+# ======================
+# --- Train Prep ---
+# ======================
+
+X = df.drop(columns=['Churn'])
+df['Churn'] = df['Churn'].map({'Yes': 1, 'No': 0})
+y = df['Churn']
+
+print('Label Encoder Transformation')
+
+# Encode categorical features
+le = LabelEncoder()
+X_encoded = X.copy()
+for i in categorical:
+    X_encoded[i] = le.fit_transform(X_encoded[i])
+    #print(i, ':', X_encoded[i].unique(), '=', le.inverse_transform(X_encoded[i].unique()))
+
+# Scale numerical data
+scalar = MinMaxScaler()
+X_encoded[numerical] = scalar.fit_transform(X[numerical])
+
+# Feature selection
+X_num = X[numerical]
+numeric_selector = SelectKBest(score_func=f_classif, k='all')
+numeric_selector.fit(X_num, y)
+anova_scores = pd.DataFrame({
+    'Feature': X_num.columns,
+    'Anova Score': numeric_selector.scores_
+}).sort_values(by='Anova Score', ascending=False)
+
+X_cat = X_encoded[categorical]
+categorical_selector = SelectKBest(score_func=chi2, k='all')
+categorical_selector.fit(X_cat, y)
+chi2_scores = pd.DataFrame({
+    'Feature': X_cat.columns,
+    'Chi2 Score': categorical_selector.scores_
+}).sort_values(by='Chi2 Score', ascending=False)
+
+# Select features
+top_cat_features = chi2_scores[chi2_scores['Chi2 Score'] > 0]['Feature'].tolist()
+top_num_features = anova_scores[anova_scores['Anova Score'] > 50]['Feature'].tolist()
+selected_features = top_cat_features + top_num_features
+
+print(chi2_scores)
+print(anova_scores)
+
+X_encoded = X_encoded[selected_features]
+
+# Train-test split
+X_train, X_test, y_train, y_test = train_test_split(
+    X_encoded, y, test_size=0.2, random_state=42
+)
+
+# Handle imbalance
+smote = SMOTE(random_state=42, sampling_strategy=1)
+X_resampled, y_resampled = smote.fit_resample(X_train, y_train)
+
+scale_pos_weight = len(y_train[y_train == 0]) / len(y_train[y_train == 1])
+
+
+# ======================
+# --- Train Model ---
+# ======================
+def stack_ensemble():
+    """Build and evaluate stacked ensemble model."""
+
+    # Base learners
+    xgb = XGBClassifier(
+        eval_metric='logloss', random_state=42,
+        n_estimators=200, max_depth=7, learning_rate=0.05
+    )
+
+    light = LGBMClassifier(
+        random_state=42, verbose=-1,
+        n_estimators=500, max_depth=7, learning_rate=0.1,
+    )
+
+    rf = RandomForestClassifier(
+        random_state=42,
+        n_estimators=200, max_depth=3,
+        class_weight='balanced'
+    )
+
+    dt = DecisionTreeClassifier(
+        random_state=1000,
+        max_depth=3, min_samples_leaf=4,
+    )
+
+    # Meta learner
+    meta = LGBMClassifier(
+        random_state=42, verbose=-1,
+        n_estimators=200, max_depth=3, learning_rate=0.05,
+        class_weight='balanced'
+    )
+
+    # Stacking classifier
+    stack = StackingClassifier(
+        estimators=[('xgb', xgb), ('light', light), ('rf', rf), ('dt', dt)],
+        final_estimator=meta,
+        n_jobs=-1
+    )
+
+    # Fit on training data
+    stack.fit(X_resampled, y_resampled)
+    probs = stack.predict_proba(X_test)[:,1]
+
+    # Drawing my auc curve
+    fpr,tpr,thresholds= roc_curve(y_test,probs)
+    roc_auc= auc(fpr,tpr)
+
+    plt.plot(fpr,tpr,label='AUC = {:.2f}'.format(roc_auc))
+    plt.plot([0,1],[0,1],linestyle='--')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curve')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # Predictions
+    y_pred = stack.predict(X_test)
+    print(classification_report(y_test, y_pred))
+
+    # Confusion Matrix
+    cm = confusion_matrix(y_test, y_pred)
+    print(cm)
+    counts = np.array([val for val in cm.flatten()])
+    percentages = ['{0:.2%}'.format(val) for val in (counts / np.sum(counts))]
+    labels = ['{}\n{}'.format(c, p) for c, p in zip(counts, percentages)]
+    labels = np.asarray(labels).reshape(2, 2)
+
+    sns.heatmap(
+        cm, annot=labels, cmap='Reds', fmt='',
+        xticklabels=['No Churn', 'Churned'],
+        yticklabels=['No Churn', 'Churned']
+    )
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.title('Confusion Matrix')
+    plt.tight_layout()
+    plt.show()
+# SHAP
+    meta_model = stack.final_estimator_
+    explainer = shap.Explainer(meta_model,X_resampled) # Initialize shap
+    shap_values = explainer(X_test)
+    shap.plots.waterfall(shap_values[0],show=False)
+    plt.tight_layout()
+    plt.show()
+    shap.summary_plot(shap_values,X_test,show=False)
+    plt.tight_layout()
+    plt.show()
+
+
+    # Get precision and recall values
+    # ave_auc= average_precision_score(y_test,probs)
+    # print('The Average Precision Score is {:.2f}'.format(ave_auc))
+
+    kmf =  KaplanMeierFitter()
+    fig,ax = plt.subplots(figsize=(10,6))
+    for name, grouped_df in df.groupby('Contract'):
+
+        kmf.fit(grouped_df['tenure'],grouped_df['Churn'],label=name)
+        kmf.plot_survival_function(ax=ax)
+    ax.set_title('Kaplan-Meier Churn Curves')
+    ax.set_xlabel('Time')
+    ax.set_ylabel('Churn Probability')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    return probs,y_test
+
+
+def cost_benefit(args,kwargs):
+
+    gain_tp = 1098  # Correctly retained churner
+    cost_fp = -102  # Wasted retention on loyal customer
+    cost_fn = -1200  # Lost churner
+    gain_tn = 0  # Correctly ignored loyal customer
+
+    threshold = np.arange(0.01,1.0,0.01)
+    profits = []
+    for t in threshold:
+        pred = (args>=t).astype(int)
+        tn,fp,fn,tp = confusion_matrix(kwargs,pred).ravel()
+        profit = tn*gain_tn + fp*cost_fp + fn*cost_fn + tp*gain_tp
+        profits.append(profit)
+
+    profits = np.array(profits)
+    best_index = np.argmax(profits)
+    Best_t = threshold[best_index]
+    Best_p = profits[best_index]
+    Top_idx = np.argsort(profits)[-5:][::-1]
+
+    print('Best Threshold = {}'.format(Best_t))
+    print('Max Profit = $ {}'.format(Best_p))
+    print( 'Top 5 Thresholds And Profits:')
+    for val in Top_idx:
+        print('     t={} -> profit={}'.format(threshold[val],profits[val]))
+
+
+
+    plt.plot(threshold,profits,color='blue',marker='o',label= 'Price-Threshold Curve',linestyle='--')
+    plt.axvline(Best_t,color='red',linestyle=':',label = 'Line from best threshold value {:.2f}'.format(Best_t))
+    plt.legend()
+    plt.xlabel('Thresholds')
+    plt.ylabel('Profits')
+    plt.title( 'Price vs Threshold Curve')
+    plt.tight_layout()
+    plt.grid(True)
+    plt.show()
+    return Best_p,Best_t
+
+
+# Run the model
+probs,y_test = stack_ensemble()
+Best_p,Best_t = cost_benefit(probs,y_test)
